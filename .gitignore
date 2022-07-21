@@ -1,0 +1,7 @@
+__pycache__
+
+# vim swap
+*.*.sw*
+
+client_secrets.json
+storage.json
