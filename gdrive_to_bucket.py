@@ -2,6 +2,7 @@
 """os.walk() variation with Google Drive API."""
 
 import io
+import logging
 import os.path as osp
 import queue
 import tempfile
@@ -14,6 +15,11 @@ import click
 import google.auth
 from google.cloud import storage
 from googleapiclient.http import MediaIoBaseDownload
+import requests
+
+logging.basicConfig()
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder'
 MIME_TYPE_MAP = {
@@ -115,7 +121,7 @@ def get_drive_service():
     )
 
     service = build('drive', version='v3', credentials=creds)
-    return service
+    return service, creds
 
 def init_workers(num_workers=8, thread_kwargs=None):
     thread_kwargs = thread_kwargs or {}
@@ -127,9 +133,9 @@ def init_workers(num_workers=8, thread_kwargs=None):
 
     return file_workers
 
-def copy_file(project, bucket):
+def copy_file(project, bucket, dry_run=False):
     with LOCK:
-        service = get_drive_service()
+        service, creds = get_drive_service()
         client = storage.Client(
             project=project,
             credentials=google.auth.default()[0],
@@ -142,15 +148,19 @@ def copy_file(project, bucket):
             if f is None:
                 break
 
-            _copy_file(f, service, bucket)
-        except Exception:
-            # TODO
-            pass
+            _copy_file(f, service, creds, bucket, dry_run=dry_run)
+        except Exception as e:
+            log('error', f'Error copying: {f.drivePath} => gs://{bucket.name}/{f.bucketPath}')
+            log('error', e)
         finally:
             file_queue.task_done()
 
-def _copy_file(f, service, bucket):
+def _copy_file(f, service, creds, bucket, dry_run=False):
     with tempfile.NamedTemporaryFile() as fh:
+        if dry_run:
+            log('info', f'Copied: {f.id} {f.drivePath} => gs://{bucket.name}/{f.bucketPath}')
+            return
+
         #
         # download
         #
@@ -162,14 +172,24 @@ def _copy_file(f, service, bucket):
                 raise UnsupportedMimeType()
 
             f.mimeType = mime_type
-            req = service.files().export_media(fileId=f.id, mimeType=mime_type)
+
+            response = service.files().get(fileId=f.id, supportsAllDrives=True, fields='*').execute()
+            response = requests.get(
+                response['exportLinks'][mime_type],
+                headers={
+                    'Authorization': 'bearer {creds.access_token}'
+                },
+                stream=True
+            )
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                fh.write(chunk)
         else:
             req = service.files().get_media(fileId=f.id)
-
-        downloader = MediaIoBaseDownload(file, req)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+            downloader = MediaIoBaseDownload(file, req)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
 
         #
         # upload
@@ -180,17 +200,23 @@ def _copy_file(f, service, bucket):
         blob.content_type = f.mimeType
         blob.patch()
 
-        print(f'Copied: {f.id} {f.drivePath} => gs://{bucket.name}/{f.bucketPath}')
+        log('info', f'Copied: {f.id} {f.drivePath} => gs://{bucket.name}/{f.bucketPath}')
+
+def log(level, msg):
+    fn = getattr(logger, level)
+    message = f'({threading.get_ident()}) {msg})'
+    fn(message)
 
 @click.command()
 @click.option('--project', '-p', required=True, help='Name of GCP Project containing GCP Storage Bucket')
 @click.option('--drive', '-d', default="//My Drive/", help='Google Drive Path: //<DRIVE_NAME>/FOLDER/PATH. Use `//My Drive/` for your private Google Drive')
 @click.option('--bucket', '-b', required=True, help='Name of existing GCP Storage Bucket where files from Google Drive will be copied')
 @click.option('--workers', '-w', default=8, type=int, help='Number of workers to do the copying from Google Drive to Bucket')
-def copy_from_gdrive_to_bucket(project, drive, bucket, workers):
+@click.option('--dry-run', is_flag=True)
+def copy_from_gdrive_to_bucket(project, drive, bucket, workers, dry_run):
     if not drive.startswith('//'):
         drive = '//' + osp.join('My Drive', (drive if drive[0] != '/' else drive[1:]))
-        print(f'Assuming "My Drive": {drive}')
+        logger.info(f'Assuming "My Drive": {drive}')
 
     drive_name, drive_prefix = drive[2:].split('/', 1)
     if drive_prefix.endswith('/'):
@@ -200,13 +226,14 @@ def copy_from_gdrive_to_bucket(project, drive, bucket, workers):
     drive_id = None
     drive_parent = 'root'
 
-    service = get_drive_service()
+    service, creds = get_drive_service()
 
     file_workers = init_workers(
         workers,
         thread_kwargs={
             'project': project,
-            'bucket': bucket
+            'bucket': bucket,
+            'dry_run': dry_run,
         }
     )
 
@@ -232,7 +259,7 @@ def copy_from_gdrive_to_bucket(project, drive, bucket, workers):
 
     while True:
         qsize = file_queue.qsize()
-        print(f'Estimate to process: {qsize}')
+        logger.info(f'Estimate to process: {qsize}')
         if qsize < 5:
             break
         time.sleep(10)
@@ -243,7 +270,7 @@ def copy_from_gdrive_to_bucket(project, drive, bucket, workers):
 
     file_queue.join()
 
-    print('All done! Bye...')
+    logger.info('All done! Bye...')
 
 if __name__ == '__main__':
     copy_from_gdrive_to_bucket()
